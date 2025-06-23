@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "homepage": "https://github.com/KeshavMajithia/smartroute-ai",
+  "homepage": "https://KeshavMajithia.github.io/smartroute-ai",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
