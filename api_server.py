@@ -360,3 +360,8 @@ def root():
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8001))
     app.run(host='0.0.0.0', port=port, debug=False)
+
+# For production deployment
+if __name__ != "__main__":
+    # Configure for gunicorn
+    app.config['DEBUG'] = False
