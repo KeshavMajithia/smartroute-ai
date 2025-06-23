@@ -1,10 +1,13 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import json
 import random
 import math
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
 import requests
 import os
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # --- LOAD MODEL-BASED GRID COLORS ---
 model_grid_path = os.path.join(os.path.dirname(__file__), 'RoadHealth', 'grid_colors.json')
@@ -38,6 +41,7 @@ qualities = ['Good', 'Satisfactory', 'Poor', 'Very Poor']
 weights = [0.4, 0.3, 0.2, 0.1]
 quality_colors = {'Good': '#22c55e', 'Satisfactory': '#f97316', 'Poor': '#ef4444', 'Very Poor': '#8b4513', 'Unknown': '#6b7280'}
 
+# Initialize grid
 for row in range(grid_size):
     for col in range(grid_size):
         lat_min = delhi_bounds['lat_min'] + row * lat_step
@@ -256,140 +260,103 @@ def get_direct_osrm_route_with_waypoints(waypoints):
     # Fallback: connect waypoints with straight lines
     return waypoints
 
-# --- HTTP SERVER ---
-class SmartRouteHandler(BaseHTTPRequestHandler):
-    def _send_cors_headers(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+# --- FLASK ROUTES ---
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy'})
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self._send_cors_headers()
-        self.end_headers()
+@app.route('/grid', methods=['GET'])
+def get_grid():
+    grid_data = {
+        'grid_size': grid_size, 
+        'delhi_bounds': delhi_bounds, 
+        'cells': list(grid.values())
+    }
+    return jsonify({'success': True, 'data': grid_data})
 
-    def do_GET(self):
-        if self.path == '/grid':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self._send_cors_headers()
-            self.end_headers()
-            grid_data = {'grid_size': grid_size, 'delhi_bounds': delhi_bounds, 'cells': list(grid.values())}
-            self.wfile.write(json.dumps({'success': True, 'data': grid_data}).encode())
-        elif self.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self._send_cors_headers()
-            self.end_headers()
-            self.wfile.write(json.dumps({'status': 'healthy'}).encode())
+@app.route('/route', methods=['POST'])
+def find_route():
+    try:
+        data = request.get_json()
+        
+        start_lat = data.get('start_lat')
+        start_lng = data.get('start_lng')
+        end_lat = data.get('end_lat')
+        end_lng = data.get('end_lng')
+
+        if not all([start_lat, start_lng, end_lat, end_lng]):
+            return jsonify({'success': False, 'message': 'Missing coordinates'}), 400
+
+        # Determine start and end grid positions
+        start_row = max(0, min(int((start_lat - delhi_bounds['lat_min']) / lat_step), grid_size - 1))
+        start_col = max(0, min(int((start_lng - delhi_bounds['lng_min']) / lng_step), grid_size - 1))
+        end_row = max(0, min(int((end_lat - delhi_bounds['lat_min']) / lat_step), grid_size - 1))
+        end_col = max(0, min(int((end_lng - delhi_bounds['lng_min']) / lng_step), grid_size - 1))
+
+        # First, try direct route and analyze its quality
+        direct_route, route_status = get_direct_osrm_route_with_avoidance(start_lat, start_lng, end_lat, end_lng)
+        
+        if route_status == "direct":
+            # Direct route is good enough
+            full_route = direct_route
+            routing_method = "direct"
         else:
-            self.send_response(404)
-            self.send_header('Content-type', 'application/json')
-            self._send_cors_headers()
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': 'Not Found'}).encode())
+            # Need to guide through better quality areas
+            quality_cells = find_quality_constrained_cells(start_row, start_col, end_row, end_col)
+            full_route = get_guided_route_with_waypoints(start_lat, start_lng, end_lat, end_lng, quality_cells)
+            routing_method = "guided"
 
-    def do_POST(self):
-        if self.path == '/route':
-            try:
-                content_length = int(self.headers['Content-Length'])
-                post_data = self.rfile.read(content_length)
-                data = json.loads(post_data.decode('utf-8'))
-                
-                start_lat = data.get('start_lat')
-                start_lng = data.get('start_lng')
-                end_lat = data.get('end_lat')
-                end_lng = data.get('end_lng')
+        # Analyze route quality for response
+        route_qualities = []
+        quality_summary = {"Good": 0, "Satisfactory": 0, "Poor": 0, "Very Poor": 0, "Unknown": 0}
+        
+        for lat, lng in full_route[::5]:  # Sample every 5th point
+            row = max(0, min(int((lat - delhi_bounds['lat_min']) / lat_step), grid_size - 1))
+            col = max(0, min(int((lng - delhi_bounds['lng_min']) / lng_step), grid_size - 1))
+            cell = grid.get(f'{row},{col}')
+            quality = cell['quality'] if cell else 'Unknown'
+            route_qualities.append(quality)
+            quality_summary[quality] += 1
 
-                if not all([start_lat, start_lng, end_lat, end_lng]):
-                    self.send_response(400)
-                    self.send_header('Content-type', 'application/json')
-                    self._send_cors_headers()
-                    self.end_headers()
-                    self.wfile.write(json.dumps({'success': False, 'message': 'Missing coordinates'}).encode())
-                    return
+        # Calculate total distance
+        total_distance = 0
+        if len(full_route) > 1:
+            for i in range(len(full_route) - 1):
+                lat1, lon1 = full_route[i]
+                lat2, lon2 = full_route[i + 1]
+                # Approximate distance calculation
+                distance = math.sqrt((lat2 - lat1)**2 + (lon2 - lon1)**2) * 111  # Rough km conversion
+                total_distance += distance
 
-                # Determine start and end grid positions
-                start_row = max(0, min(int((start_lat - delhi_bounds['lat_min']) / lat_step), grid_size - 1))
-                start_col = max(0, min(int((start_lng - delhi_bounds['lng_min']) / lng_step), grid_size - 1))
-                end_row = max(0, min(int((end_lat - delhi_bounds['lat_min']) / lat_step), grid_size - 1))
-                end_col = max(0, min(int((end_lng - delhi_bounds['lng_min']) / lng_step), grid_size - 1))
+        response = {
+            'success': True,
+            'route_coordinates': full_route,
+            'distance': round(total_distance, 2),
+            'duration': round(total_distance * 2, 1),  # Rough duration estimate
+            'route_qualities': route_qualities,
+            'quality_summary': quality_summary,
+            'routing_method': routing_method,
+            'start_cell': {'row': start_row, 'col': start_col, 'quality': grid[f'{start_row},{start_col}']['quality']},
+            'end_cell': {'row': end_row, 'col': end_col, 'quality': grid[f'{end_row},{end_col}']['quality']}
+        }
+        
+        return jsonify(response)
+    
+    except Exception as e:
+        print(f"Error processing route request: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
 
-                # First, try direct route and analyze its quality
-                direct_route, route_status = get_direct_osrm_route_with_avoidance(start_lat, start_lng, end_lat, end_lng)
-                
-                if route_status == "direct":
-                    # Direct route is good enough
-                    full_route = direct_route
-                    routing_method = "direct"
-                else:
-                    # Need to guide through better quality areas
-                    quality_cells = find_quality_constrained_cells(start_row, start_col, end_row, end_col)
-                    full_route = get_guided_route_with_waypoints(start_lat, start_lng, end_lat, end_lng, quality_cells)
-                    routing_method = "guided"
-
-                # Analyze route quality for response
-                route_qualities = []
-                quality_summary = {"Good": 0, "Satisfactory": 0, "Poor": 0, "Very Poor": 0, "Unknown": 0}
-                
-                for lat, lng in full_route[::5]:  # Sample every 5th point
-                    row = max(0, min(int((lat - delhi_bounds['lat_min']) / lat_step), grid_size - 1))
-                    col = max(0, min(int((lng - delhi_bounds['lng_min']) / lng_step), grid_size - 1))
-                    cell = grid.get(f'{row},{col}')
-                    quality = cell['quality'] if cell else 'Unknown'
-                    route_qualities.append(quality)
-                    quality_summary[quality] += 1
-
-                # Calculate total distance
-                total_distance = 0
-                if len(full_route) > 1:
-                    for i in range(len(full_route) - 1):
-                        lat1, lon1 = full_route[i]
-                        lat2, lon2 = full_route[i + 1]
-                        # Approximate distance calculation
-                        distance = math.sqrt((lat2 - lat1)**2 + (lon2 - lon1)**2) * 111  # Rough km conversion
-                        total_distance += distance
-
-                response = {
-                    'success': True,
-                    'route_coordinates': full_route,
-                    'distance': round(total_distance, 2),
-                    'duration': round(total_distance * 2, 1),  # Rough duration estimate
-                    'route_qualities': route_qualities,
-                    'quality_summary': quality_summary,
-                    'routing_method': routing_method,
-                    'start_cell': {'row': start_row, 'col': start_col, 'quality': grid[f'{start_row},{start_col}']['quality']},
-                    'end_cell': {'row': end_row, 'col': end_col, 'quality': grid[f'{end_row},{end_col}']['quality']}
-                }
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self._send_cors_headers()
-                self.end_headers()
-                self.wfile.write(json.dumps(response).encode())
-            
-            except Exception as e:
-                print(f"Error processing route request: {e}")
-                self.send_response(500)
-                self.send_header('Content-type', 'application/json')
-                self._send_cors_headers()
-                self.end_headers()
-                self.wfile.write(json.dumps({'success': False, 'message': str(e)}).encode())
-        else:
-            self.send_response(404)
-            self.send_header('Content-type', 'application/json')
-            self._send_cors_headers()
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': 'Not Found'}).encode())
-
+@app.route('/', methods=['GET'])
+def root():
+    return jsonify({
+        'message': 'SmartRoute AI API',
+        'endpoints': {
+            'GET /health': 'Health check',
+            'GET /grid': 'Get grid data',
+            'POST /route': 'Find route between coordinates'
+        }
+    })
 
 if __name__ == "__main__":
-    server_address = ('localhost', 8001)
-    httpd = HTTPServer(server_address, SmartRouteHandler)
-    print("🚀 Starting SmartRoute AI API Server...")
-    print(f"🌐 API available at: http://{server_address[0]}:{server_address[1]}")
-    print("  GET /grid     - Get grid data")
-    print("  POST /route   - Find route between coordinates")
-    print("  GET /health   - Health check")
-    print("\nPress Ctrl+C to stop the server")
-    httpd.serve_forever()
+    port = int(os.environ.get('PORT', 8001))
+    app.run(host='0.0.0.0', port=port, debug=False)
