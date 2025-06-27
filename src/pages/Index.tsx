@@ -1,9 +1,10 @@
-
 import { useState } from "react";
 import { MapComponent } from "@/components/MapComponent";
 import { Sidebar } from "@/components/Sidebar";
 import { Header } from "@/components/Header";
 import { ThemeProvider } from "@/components/ThemeProvider";
+
+// NOTE: The /admin page is intentionally not linked from anywhere in the main UI. Access it directly via /admin.
 
 const Index = () => {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
